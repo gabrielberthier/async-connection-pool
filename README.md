@@ -1,4 +1,4 @@
-# [unstable] szado/reactphp-connection-pool
+# [unstable] gabriel/reactphp-connection-pool
 
 Async and flexible pool for any type of connections built on top of [ReactPHP](https://reactphp.org/).
 
