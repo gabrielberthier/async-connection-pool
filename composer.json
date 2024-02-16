@@ -1,0 +1,35 @@
+{
+    "name": "ravine/pool",
+    "description": "Simple and universal connection pool.",
+    "type": "library",
+    "require": {
+        "react/promise": "^3",
+        "react/async": "^4",
+        "react/event-loop": "^1.2",
+        "guzzlehttp/promises": "^2.0",
+        "php-ds/php-ds": "^1.5",
+        "revolt/event-loop-adapter-react": "^1.1",
+        "react/http": "^1.9",
+        "amphp/amp": "^3.0"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10"
+    },
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "Ravine\\ConnectionPool\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Ravine\\Tests\\ConnectionPool\\": "tests/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Gabriel Nogueira Berthier",
+            "email": "gabrielnberthier@gmail.com"
+        }
+    ]
+}
