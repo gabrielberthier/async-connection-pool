@@ -10,7 +10,7 @@ interface ObjectFactoryInterface
 {
     /**
      * 
-     * @return PoolItem<TObject>
+     * @return ?PoolItem<TObject>
      */
-    function create(): PoolItem;
+    function create(): ?PoolItem;
 }

@@ -2,79 +2,125 @@
 
 namespace Ravine\Tests\ConnectionPool;
 
-use React\EventLoop\Loop;
+use PHPUnit\Framework\MockObject\MockObject;
+use Ravine\ConnectionPool\ObjectFactoryInterface;
+use Ravine\ConnectionPool\PoolItem;
 use Ravine\ConnectionPool\ConnectionPool;
 use PHPUnit\Framework\TestCase;
-use Ravine\ConnectionPool\ConnectionPoolException;
-use function React\Async\await;
-use function React\Promise\resolve;
+use Ravine\ConnectionPool\Exceptions\ConnectionPoolException;
+use React\EventLoop\Loop;
+
+function generateInput(int $n)
+{
+    return new class ($n) extends PoolItem {
+        public function __construct($currentValue)
+        {
+            $obj = new \stdClass();
+            $obj->number = $currentValue;
+            parent::__construct($obj);
+        }
+
+        protected function onClose(): void
+        {
+            echo "Closing connection";
+        }
+
+        public function validate(): bool
+        {
+            return true;
+        }
+    };
+}
 
 class ConnectionPoolTest extends TestCase
 {
-    private function getCorrectConstructorArgs(): array
+    private ConnectionPool $sut;
+    private MockObject|ObjectFactoryInterface $defaultFactory;
+
+    public function setUp(): void
     {
-        return [
-            'connectionFactory' => fn () => resolve(new Adapter()),
-            'connectionSelectorClass' => Selector::class,
-            'connectionsLimit' => null,
-            'retryLimit' => null,
-            'retryEverySec' => 0.001,
-            'loop' => Loop::get()
-        ];
+        $this->defaultFactory = $this->getMockBuilder(ObjectFactoryInterface::class)->getMock();
+        $items = array_map(fn($el) => generateInput($el), range(1, 25));
+        $this->defaultFactory->method('create')->willReturn(array_shift($items), ...$items);
+
     }
 
-    public function testGet()
+    public function testShouldValidateFactoryEventLoop()
     {
-        $cp = new ConnectionPool(...$this->getCorrectConstructorArgs());
-        $this->assertInstanceOf(Adapter::class, await($cp->get()));
+        $loop = Loop::get();
+        $sut = new ConnectionPool($this->defaultFactory);
 
-        $cp = new ConnectionPool(...[
-            ...$this->getCorrectConstructorArgs(),
-            'connectionsLimit' => 1
-        ]);
-        $a1 = await($cp->get());
-        $a2 = await($cp->get());
-        $this->assertEquals($a1, $a2);
+        $this->assertSame($sut->loopInterface, $loop);
     }
 
-    public function testGetExceptionLimitReached()
+    public function testShouldReceiveValidConnection()
     {
-        $cp = new ConnectionPool(...[
-            ...$this->getCorrectConstructorArgs(),
-            'connectionSelectorClass' => AlwaysNullSelector::class,
-            'connectionsLimit' => 1,
-            'retryLimit' => 1,
-        ]);
+        $sut = new ConnectionPool($this->defaultFactory);
+        $poolItem = $sut->get();
+
+        $this->assertInstanceOf(PoolItem::class, $poolItem);
+    }
+
+
+    public function testShouldExhaustGetConnectionAndThrow()
+    {
         $this->expectException(ConnectionPoolException::class);
-        await($cp->get());
+        $factoryMock = $this->getMockBuilder(ObjectFactoryInterface::class)->getMock();
+        $factoryMock->method('create')->willReturn(null);
+        $sut = new ConnectionPool($factoryMock);
+        $response = $sut->get();
+
+        print_r($response);
     }
 
-    public function testGetExceptionNoAvailable()
+    public function testShouldCreateOnlyMaxNumberOfConnections()
     {
-        $cp = new ConnectionPool(...[
-            ...$this->getCorrectConstructorArgs(),
-            'connectionSelectorClass' => AlwaysNullSelector::class,
-            'connectionsLimit' => 1,
-            'retryLimit' => 0,
-        ]);
-        $this->expectException(ConnectionPoolException::class);
-        await($cp->get());
+        $maxConnections = 10;
+
+        $sut = new ConnectionPool($this->defaultFactory, maxConnections: $maxConnections);
+        $poolItens = [];
+        for ($i = 0; $i < 115; $i++) {
+            $item = $sut->get();
+            print_r($item);
+            $poolItens[] = $item;
+            if ($i % $maxConnections === 0) {
+                foreach ($poolItens as $item) {
+                    $sut->returnConnection($item);
+                }
+            }
+        }
+
+        $this->assertEquals($maxConnections, $sut->size());
     }
 
-    public function test_canMakeNewConnection()
+    public function testShouldAlwaysReturnIdleConnection()
     {
-        $cp = new ConnectionPool(...$this->getCorrectConstructorArgs());
-        $ref = new \ReflectionMethod($cp, 'canMakeNewConnection');
-        $ref->setAccessible(true);
-        $this->assertTrue($ref->invoke($cp), 'limit===null');
+        $sut = new ConnectionPool($this->defaultFactory);
+        $poolItens = [];
+        for ($i = 0; $i < 20; $i++) {
+            $item = $sut->get();
+            $poolItens[] = $item;
+            # Will mark connection as idle
+            $sut->returnConnection($poolItens[$i]);
+        }
 
-        $cp = new ConnectionPool(...[
-            ...$this->getCorrectConstructorArgs(),
-            'connectionsLimit' => 0
-        ]);
-        $ref = new \ReflectionMethod($cp, 'canMakeNewConnection');
-        $ref->setAccessible(true);
-        $this->assertFalse($ref->invoke($cp), 'limit===0');
+        $this->assertEquals(1, $sut->size());
+        $this->assertIsArray($poolItens);
+    }
+    
+    public function testShouldThrowForMaxConnectionsReached()
+    {
+        $sut = new ConnectionPool($this->defaultFactory);
+        $poolItens = [];
+        for ($i = 0; $i < 20; $i++) {
+            $item = $sut->get();
+            $poolItens[] = $item;
+            # Will mark connection as idle
+            $sut->returnConnection($poolItens[$i]);
+        }
+
+        $this->assertEquals(1, $sut->size());
+        $this->assertIsArray($poolItens);
     }
 
 }

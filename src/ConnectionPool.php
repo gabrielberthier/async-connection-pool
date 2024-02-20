@@ -7,10 +7,22 @@ namespace Ravine\ConnectionPool;
 use Amp\DeferredFuture;
 use Amp\Future;
 use Ravine\ConnectionPool\Exceptions\ConnectionPoolException;
-use Revolt\EventLoop;
+use React\EventLoop\Loop;
+use React\EventLoop\LoopInterface;
+use React\EventLoop\TimerInterface;
+use React\Promise\Deferred;
+use React\Promise\Promise;
+use React\Promise\PromiseInterface;
 use Ravine\ConnectionPool\Exceptions\SqlException;
 
-use function Amp\async;
+use function React\Async\await;
+use function React\Async\async;
+use function React\Promise\resolve;
+
+function println(string $value)
+{
+    echo $value . PHP_EOL;
+}
 
 /**
  * @template T
@@ -22,26 +34,33 @@ class ConnectionPool implements ConnectionPoolInterface
     public const DEFAULT_MAX_CONNECTIONS = 100;
     public const DEFAULT_IDLE_TIMEOUT = 60;
 
-    /** @var \SplQueue<PoolItem<T>> */
-    private readonly \SplQueue $idle;
+    /** @var \DS\Set<PoolItem<T>> */
+    private readonly \DS\Set $idle;
 
-    /** @var \SplObjectStorage<PoolItem<T>, null> */
-    private readonly \SplObjectStorage $locked;
+    /** @var \DS\Set<PoolItem<T>> */
+    private readonly \DS\Set $locked;
 
-    /** @var Future<PoolItem<T>>|null */
-    private ?Future $future = null;
+    /** @var ?PromiseInterface<?PoolItem<T>> */
+    private ?PromiseInterface $future = null;
 
-    /** @var DeferredFuture<PoolItem<T>>|null */
-    private ?DeferredFuture $awaitingConnection = null;
+    /** @var ?Deferred<?PoolItem<T>> */
+    private ?Deferred $awaitingConnection = null;
 
-    private readonly DeferredFuture $onClose;
+    /** @var ?Deferred<null> */
+    private readonly Deferred $onClose;
     private int $countPopAttempts;
+
+    private bool $isClosed;
+
+    public LoopInterface $loopInterface;
 
     public function __construct(
         private readonly ObjectFactoryInterface $factory,
         private readonly int $maxConnections = self::DEFAULT_MAX_CONNECTIONS,
         private int $idleTimeout = self::DEFAULT_IDLE_TIMEOUT,
-        private int $maxRetries = 7
+        private int $maxRetries = 7,
+        private int $discardIdleConnectionsIn = 1,
+        ?LoopInterface $loop = null
     ) {
         if ($this->idleTimeout < 1) {
             throw new \Error("The idle timeout must be 1 or greater");
@@ -51,20 +70,19 @@ class ConnectionPool implements ConnectionPoolInterface
             throw new \Error("Pool must contain at least one connection");
         }
 
-        $this->locked = new \SplObjectStorage();
-        $this->idle = new \SplQueue();
-        $this->onClose = new DeferredFuture();
+        $this->locked = new \DS\Set();
+        $this->idle = new \DS\Set();
+        $this->onClose = new Deferred();
         $this->countPopAttempts = 0;
+        $loop ??= Loop::get();
 
-        $timeoutWatcher = EventLoop::repeat(
-            1,
-            $this->discardIdleConnections(...)
-        );
+        $timer = $loop->addPeriodicTimer($discardIdleConnectionsIn, $this->discardIdleConnections(...));
 
-        EventLoop::unreference($timeoutWatcher);
+        $this->loopInterface = $loop;
+        $this->isClosed = false;
         $this->onClose
-            ->getFuture()
-            ->finally(static fn() => EventLoop::cancel($timeoutWatcher));
+            ->promise()
+            ->finally(static fn() => $loop->cancelTimer($timer));
     }
 
     public function size(): int
@@ -91,7 +109,7 @@ class ConnectionPool implements ConnectionPoolInterface
 
     public function isClosed(): bool
     {
-        return $this->onClose->isComplete();
+        return $this->isClosed;
     }
 
     /**
@@ -101,22 +119,31 @@ class ConnectionPool implements ConnectionPoolInterface
      */
     public function close(): void
     {
-        if ($this->onClose->isComplete()) {
+        if ($this->isClosed) {
             return;
         }
 
         foreach ($this->locked as $conn) {
-            $this->idle->enqueue($conn);
+            $this->idle->add($conn);
         }
+
+        $promises = [];
 
         /** @var PoolItem<T> $connection */
         foreach ($this->idle as $connection) {
-            async(fn() => $connection->close())->ignore();
+            $promises[] = new Promise(fn($resolve) => $resolve($connection->close()));
         }
 
-        $this->onClose->complete();
+        \React\Promise\all($promises)->then(function (array $promises) {
+            println("Finished connections");
+        });
 
-        $this->awaitingConnection?->error(
+        $this->onClose->promise()->then(function () {
+            $this->isClosed = true;
+        });
+        $this->onClose->resolve(null);
+
+        $this->awaitingConnection?->reject(
             new SqlException("Connection pool closed")
         );
         $this->awaitingConnection = null;
@@ -135,6 +162,8 @@ class ConnectionPool implements ConnectionPoolInterface
     /** @param PoolItem<T> $connection */
     public function returnConnection(PoolItem $connection)
     {
+        println("Returned connection");
+        print_r($connection);
         $this->push($connection);
     }
 
@@ -147,10 +176,12 @@ class ConnectionPool implements ConnectionPoolInterface
      */
     protected function pop(): PoolItem
     {
-        if (++$this->countPopAttempts <= $this->maxRetries) {
+        println("Attempting to get available connection");
+        if (++$this->countPopAttempts >= $this->maxRetries) {
+            println("Max attempts achieved");
             $this->close();
 
-            new ConnectionPoolException(
+            throw new ConnectionPoolException(
                 "No available connection to use; $this->maxRetries retries were made and reached the limit"
             );
         }
@@ -159,16 +190,18 @@ class ConnectionPool implements ConnectionPoolInterface
         }
 
         while ($this->future !== null) {
-            $this->future->await(); // Wait until all pending futures are resolved.
+            println("Waiting");
+            resolve($this->future); // Wait until all pending futures are resolved.
         }
 
         // Attempt to get an idle connection.
         while (!$this->idle->isEmpty()) {
-            /** @var PoolItem */
-            $connection = $this->idle->dequeue();
+            $connection = $this->idle->first();
+            $this->idle->remove($connection);
 
             if (!$connection->isClosed()) {
-                $this->locked->attach($connection);
+                $this->locked->add($connection);
+                $connection->setLastUsedAt(\time());
                 $this->resetAttemptsCounter();
 
                 return $connection;
@@ -179,7 +212,9 @@ class ConnectionPool implements ConnectionPoolInterface
         if ($this->size() < $this->maxConnections) {
             $connection = $this->createConnection();
             if (!is_null($connection)) {
-                $this->locked->attach($connection);
+                println("Connection created.");
+
+                $this->locked->add($connection);
                 $this->resetAttemptsCounter();
 
                 return $connection;
@@ -188,8 +223,9 @@ class ConnectionPool implements ConnectionPoolInterface
 
         // If all connections are busy, wait until one becomes available.
         try {
-            $this->awaitingConnection = new DeferredFuture();
-            ($this->future = $this->awaitingConnection->getFuture())->await();
+            $this->awaitingConnection = new Deferred();
+            $this->future = $this->awaitingConnection->promise();
+            resolve($this->future);
         } finally {
             $this->awaitingConnection = null;
             $this->future = null;
@@ -211,13 +247,13 @@ class ConnectionPool implements ConnectionPoolInterface
             "Connection is not part of this pool"
         );
 
-        $this->locked->detach($connection);
+        $this->locked->remove($connection);
 
         if (!$connection->isClosed()) {
-            $this->idle->enqueue($connection);
+            $this->idle->add($connection);
         }
 
-        $this->awaitingConnection?->complete($connection);
+        $this->awaitingConnection?->resolve($connection);
         $this->awaitingConnection = null;
     }
 
@@ -225,11 +261,8 @@ class ConnectionPool implements ConnectionPoolInterface
     private function createConnection(): ?PoolItem
     {
         try {
-            /** @var PoolItem<T> */
-            $connection = ($this->future = async(
-                fn() => $this->factory->create()
-            )
-            )->await();
+            $connection = $this->factory->create();
+            print_r($connection);
         } finally {
             $this->future = null;
         }
@@ -243,19 +276,19 @@ class ConnectionPool implements ConnectionPoolInterface
         return $connection;
     }
 
-    private function discardIdleConnections()
+    public function discardIdleConnections(TimerInterface $timerInterface)
     {
+        println("Called discard connections");
         $now = \time();
         while (!$this->idle->isEmpty()) {
-            /** @var PoolItem<T> $connection */
-            $connection = $this->idle->bottom();
+            $connection = $this->idle->first();
 
             if ($connection->getLastUsedAt() + $this->idleTimeout > $now) {
                 return;
             }
 
             // Close connection and remove it from the pool.
-            $this->idle->shift();
+            $this->idle->remove($connection);
             $connection->close();
         }
     }
@@ -265,37 +298,3 @@ class ConnectionPool implements ConnectionPoolInterface
         $this->countPopAttempts = 0;
     }
 }
-
-/** @var PoolItem<object> $poolItem */
-$poolItem = new class extends PoolItem {
-    public function __construct()
-    {
-        $obj = new \stdClass();
-        $obj->number = 42;
-        parent::__construct($obj);
-    }
-
-    protected function onClose(): void
-    {
-        echo "Closing connection";
-    }
-
-    public function validate(): bool
-    {
-        return true;
-    }
-};
-
-$poolItem->reveal();
-
-/** @var ConnectionPool<Future> */
-$pool = new ConnectionPool(new class($poolItem) implements ObjectFactoryInterface{
-    public function __construct(public readonly PoolItem $poolItem) {
-    }
-
-    function create(): PoolItem{
-        return $this->poolItem;
-    }
-});
-
-$pool->get();
