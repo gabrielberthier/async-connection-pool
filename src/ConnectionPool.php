@@ -4,25 +4,20 @@ declare(strict_types=1);
 
 namespace Ravine\ConnectionPool;
 
-use Amp\DeferredFuture;
-use Amp\Future;
 use Ravine\ConnectionPool\Exceptions\ConnectionPoolException;
 use React\EventLoop\Loop;
 use React\EventLoop\LoopInterface;
-use React\EventLoop\TimerInterface;
 use React\Promise\Deferred;
 use React\Promise\Promise;
 use React\Promise\PromiseInterface;
 use Ravine\ConnectionPool\Exceptions\SqlException;
+use Psr\Log\LoggerInterface;
 
-use function React\Async\await;
-use function React\Async\async;
-use function React\Promise\resolve;
+use function React\Async\{await, async};
+use function React\Promise\Timer\sleep as r_sleep;
+use function React\Promise\{resolve, reject};
 
-function println(string $value)
-{
-    echo $value . PHP_EOL;
-}
+
 
 /**
  * @template T
@@ -60,6 +55,7 @@ class ConnectionPool implements ConnectionPoolInterface
         private int $idleTimeout = self::DEFAULT_IDLE_TIMEOUT,
         private int $maxRetries = 7,
         private int $discardIdleConnectionsIn = 1,
+        private ?LoggerInterface $loggerInterface = null,
         ?LoopInterface $loop = null
     ) {
         if ($this->idleTimeout < 1) {
@@ -76,7 +72,7 @@ class ConnectionPool implements ConnectionPoolInterface
         $this->countPopAttempts = 0;
         $loop ??= Loop::get();
 
-        $timer = $loop->addPeriodicTimer($discardIdleConnectionsIn, $this->discardIdleConnections(...));
+        $timer = $loop->addPeriodicTimer($discardIdleConnectionsIn, async($this->discardIdleConnections(...)));
 
         $this->loopInterface = $loop;
         $this->isClosed = false;
@@ -93,6 +89,10 @@ class ConnectionPool implements ConnectionPoolInterface
     public function __destruct()
     {
         $this->close();
+    }
+
+    public function getCountPopAttempts(){
+        return $this->countPopAttempts;
     }
 
     public function getLastUsedAt(): int
@@ -135,18 +135,13 @@ class ConnectionPool implements ConnectionPoolInterface
         }
 
         \React\Promise\all($promises)->then(function (array $promises) {
-            println("Finished connections");
+            $this->loggerInterface?->debug("Finished connections");
         });
 
         $this->onClose->promise()->then(function () {
             $this->isClosed = true;
         });
         $this->onClose->resolve(null);
-
-        $this->awaitingConnection?->reject(
-            new SqlException("Connection pool closed")
-        );
-        $this->awaitingConnection = null;
     }
 
     /**
@@ -156,42 +151,38 @@ class ConnectionPool implements ConnectionPoolInterface
      */
     public function get(): PoolItem
     {
-        return $this->pop();
+        return await($this->pop());
     }
 
     /** @param PoolItem<T> $connection */
     public function returnConnection(PoolItem $connection)
     {
-        println("Returned connection");
-        print_r($connection);
+        $this->loggerInterface?->debug("Returned connection");
         $this->push($connection);
     }
 
     /**
-     * @return PoolItem<T>
+     * @return PromiseInterface<PoolItem<T>>
      *
      * @throws SqlException If creating a new connection fails.
      * @throws ConnectionPoolException If no connections are available to be created
      * @throws \Error If the pool has been closed.
      */
-    protected function pop(): PoolItem
+    protected function pop(): PromiseInterface
     {
-        println("Attempting to get available connection");
+        $this->loggerInterface?->debug("Attempting to get available connection");
         if (++$this->countPopAttempts >= $this->maxRetries) {
-            println("Max attempts achieved");
+            $this->loggerInterface?->debug("Max attempts achieved");
             $this->close();
 
-            throw new ConnectionPoolException(
-                "No available connection to use; $this->maxRetries retries were made and reached the limit"
+            return reject(
+                new ConnectionPoolException(
+                    "No available connection to use; $this->maxRetries retries were made and reached the limit"
+                )
             );
         }
         if ($this->isClosed()) {
-            throw new \Error("The pool has been closed");
-        }
-
-        while ($this->future !== null) {
-            println("Waiting");
-            resolve($this->future); // Wait until all pending futures are resolved.
+            return reject(new \Error("The pool has been closed"));
         }
 
         // Attempt to get an idle connection.
@@ -204,35 +195,27 @@ class ConnectionPool implements ConnectionPoolInterface
                 $connection->setLastUsedAt(\time());
                 $this->resetAttemptsCounter();
 
-                return $connection;
+                return resolve($connection);
             }
         }
 
         // If no idle connections are available, create a new one if allowed.
         if ($this->size() < $this->maxConnections) {
             $connection = $this->createConnection();
+            
             if (!is_null($connection)) {
-                println("Connection created.");
+                $this->loggerInterface?->debug("Connection created.");
 
                 $this->locked->add($connection);
                 $this->resetAttemptsCounter();
 
-                return $connection;
+                return resolve($connection);
             }
         }
 
-        // If all connections are busy, wait until one becomes available.
-        try {
-            $this->awaitingConnection = new Deferred();
-            $this->future = $this->awaitingConnection->promise();
-            resolve($this->future);
-        } finally {
-            $this->awaitingConnection = null;
-            $this->future = null;
-        }
-
         // Retry until an active connection is obtained or the pool is closed.
-        return $this->pop();
+
+        return r_sleep(0.01, $this->loopInterface)->then(fn() => $this->pop());
     }
 
     /**
@@ -260,12 +243,7 @@ class ConnectionPool implements ConnectionPoolInterface
     /** @return PoolItem<T> */
     private function createConnection(): ?PoolItem
     {
-        try {
-            $connection = $this->factory->create();
-            print_r($connection);
-        } finally {
-            $this->future = null;
-        }
+        $connection = $this->factory->create();
 
         if ($this->isClosed()) {
             $connection->close();
@@ -276,9 +254,9 @@ class ConnectionPool implements ConnectionPoolInterface
         return $connection;
     }
 
-    public function discardIdleConnections(TimerInterface $timerInterface)
+    public function discardIdleConnections()
     {
-        println("Called discard connections");
+        $this->loggerInterface?->debug("Called discard connections");
         $now = \time();
         while (!$this->idle->isEmpty()) {
             $connection = $this->idle->first();

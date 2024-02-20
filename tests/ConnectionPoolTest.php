@@ -22,7 +22,7 @@ function generateInput(int $n)
 
         protected function onClose(): void
         {
-            echo "Closing connection";
+
         }
 
         public function validate(): bool
@@ -37,26 +37,31 @@ class ConnectionPoolTest extends TestCase
     private ConnectionPool $sut;
     private MockObject|ObjectFactoryInterface $defaultFactory;
 
+    private int $maxConnections = 10;
+
     public function setUp(): void
     {
         $this->defaultFactory = $this->getMockBuilder(ObjectFactoryInterface::class)->getMock();
         $items = array_map(fn($el) => generateInput($el), range(1, 25));
         $this->defaultFactory->method('create')->willReturn(array_shift($items), ...$items);
+        $this->sut = new ConnectionPool($this->defaultFactory, maxConnections: $this->maxConnections);
+    }
 
+    public function tearDown(): void
+    {
+        $this->sut->close();
     }
 
     public function testShouldValidateFactoryEventLoop()
     {
         $loop = Loop::get();
-        $sut = new ConnectionPool($this->defaultFactory);
 
-        $this->assertSame($sut->loopInterface, $loop);
+        $this->assertSame($this->sut->loopInterface, $loop);
     }
 
     public function testShouldReceiveValidConnection()
     {
-        $sut = new ConnectionPool($this->defaultFactory);
-        $poolItem = $sut->get();
+        $poolItem = $this->sut->get();
 
         $this->assertInstanceOf(PoolItem::class, $poolItem);
     }
@@ -67,60 +72,49 @@ class ConnectionPoolTest extends TestCase
         $this->expectException(ConnectionPoolException::class);
         $factoryMock = $this->getMockBuilder(ObjectFactoryInterface::class)->getMock();
         $factoryMock->method('create')->willReturn(null);
-        $sut = new ConnectionPool($factoryMock);
-        $response = $sut->get();
-
-        print_r($response);
+        $this->sut = new ConnectionPool($factoryMock);
+        $this->sut->get();
     }
 
     public function testShouldCreateOnlyMaxNumberOfConnections()
     {
-        $maxConnections = 10;
+        $maxConnections = $this->maxConnections;
 
-        $sut = new ConnectionPool($this->defaultFactory, maxConnections: $maxConnections);
         $poolItens = [];
         for ($i = 0; $i < 115; $i++) {
-            $item = $sut->get();
-            print_r($item);
+            $item = $this->sut->get();
             $poolItens[] = $item;
             if ($i % $maxConnections === 0) {
                 foreach ($poolItens as $item) {
-                    $sut->returnConnection($item);
+                    $this->sut->returnConnection($item);
                 }
             }
         }
 
-        $this->assertEquals($maxConnections, $sut->size());
+        $this->assertEquals($maxConnections, $this->sut->size());
     }
 
     public function testShouldAlwaysReturnIdleConnection()
     {
-        $sut = new ConnectionPool($this->defaultFactory);
         $poolItens = [];
         for ($i = 0; $i < 20; $i++) {
-            $item = $sut->get();
+            $item = $this->sut->get();
             $poolItens[] = $item;
             # Will mark connection as idle
-            $sut->returnConnection($poolItens[$i]);
+            $this->sut->returnConnection($poolItens[$i]);
         }
 
-        $this->assertEquals(1, $sut->size());
+        $this->assertEquals(1, $this->sut->size());
         $this->assertIsArray($poolItens);
     }
-    
-    public function testShouldThrowForMaxConnectionsReached()
+
+    public function testShouldResetGetCounter()
     {
-        $sut = new ConnectionPool($this->defaultFactory);
-        $poolItens = [];
-        for ($i = 0; $i < 20; $i++) {
-            $item = $sut->get();
-            $poolItens[] = $item;
-            # Will mark connection as idle
-            $sut->returnConnection($poolItens[$i]);
-        }
+        $defaultFactory = $this->getMockBuilder(ObjectFactoryInterface::class)->getMock();
+        $defaultFactory->method('create')->willReturn(null, null, generateInput(1));
+        $this->sut = new ConnectionPool($defaultFactory);
+        $this->sut->get();
 
-        $this->assertEquals(1, $sut->size());
-        $this->assertIsArray($poolItens);
+        $this->assertEquals(0, $this->sut->getCountPopAttempts());
     }
-
 }
