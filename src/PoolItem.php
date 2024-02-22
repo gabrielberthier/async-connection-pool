@@ -52,29 +52,3 @@ abstract class PoolItem
         $this->lastUsedAt = $time;
     }
 }
-
-
-$poolItem = new class extends PoolItem {
-    public function __construct()
-    {
-        $obj = new \stdClass();
-        $obj->number = 42;
-        parent::__construct($obj);
-    }
-
-    protected function onClose(): void
-    {
-        echo "Closing connection";
-    }
-
-    public function validate(): bool
-    {
-        return true;
-    }
-};
-
-$result = $poolItem->reveal();
-
-echo $result->number . PHP_EOL;
-echo "Validate {$poolItem->validate()}" . PHP_EOL;
-$poolItem->close();

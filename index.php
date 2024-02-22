@@ -2,14 +2,10 @@
 
 require 'vendor/autoload.php';
 
+use Ravine\ConnectionPool\ConnectionPool;
+use Ravine\ConnectionPool\Factories\PdoFactoryImplementation;
 use React\EventLoop\Loop;
-use React\Promise\Promise;
-use Revolt\EventLoop;
 use Revolt\EventLoop\React\Internal\EventLoopAdapter;
-use function React\Async\async;
-use function React\Async\await;
-use React\Promise\Timer;
-use function React\Promise\resolve;
 
 $app = function ($request, $response) {
     $response->writeHead(200, array('Content-Type' => 'text/plain'));
@@ -18,36 +14,50 @@ $app = function ($request, $response) {
 
 Loop::set(EventLoopAdapter::get());
 
+$loop = Loop::get();
+
+$sut = new ConnectionPool(new PdoFactoryImplementation(), loop: $loop);
+$items = [];
+// Warmup
+for ($i = 0; $i < 10; $i++) {
+    $items[] = $sut->get();
+}
+
+foreach ($items as $item) {
+    $sut->returnConnection($item);
+}
+
+$counter = 0;
+
+$handler = require __DIR__ . '/executor.php';
+
+
+ini_set('memory_limit', '512M');
+
+// memory_limit 128M
+// post_max_size 8M // capped at 64K
+
+// enable_post_data_reading 1
+// max_input_nesting_level 64
+// max_input_vars 1000
+
+// file_uploads 1
+// upload_max_filesize 2M
+// max_file_uploads 20
+
 $http = new React\Http\HttpServer(
-    async(function (Psr\Http\Message\ServerRequestInterface $request) {
-        try {
-            // await(
-            //     new Promise(function ($resolve, $reject) {
-            //         sleep(1);
-            //         $resolve(null);
-            //     })
-            // );
-            return new React\Http\Message\Response(
-                React\Http\Message\Response::STATUS_OK,
-                array(
-                    'Content-Type' => 'text/plain'
-                ),
-                "Hello World!\n"
-            );
-        } catch (\Throwable $th) {
-            echo $th;
-        }
-    })
+    new React\Http\Middleware\StreamingRequestMiddleware(),
+    $handler()
 );
 
 $serverAddress = '0.0.0.0:8080';
 
-echo "Server running at $serverAddress";
+echo "Server running at $serverAddress" . PHP_EOL;
 
-$socket = new React\Socket\SocketServer($serverAddress, loop: Loop::get());
+$socket = new React\Socket\SocketServer($serverAddress, loop: $loop);
 
 $http->listen($socket);
 
-EventLoop::run();
+$loop->run();
 
 echo 'Listening on ' . str_replace('tcp:', 'http:', $socket->getAddress()) . PHP_EOL;

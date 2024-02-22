@@ -21,7 +21,7 @@ use function React\Promise\{resolve, reject};
 
 /**
  * @template T
- * 
+ * @implements ConnectionPoolInterface<T>
  * @template-implements ConnectionPoolInterface<T>
  */
 class ConnectionPool implements ConnectionPoolInterface
@@ -72,13 +72,30 @@ class ConnectionPool implements ConnectionPoolInterface
         $this->countPopAttempts = 0;
         $loop ??= Loop::get();
 
-        $timer = $loop->addPeriodicTimer($discardIdleConnectionsIn, async($this->discardIdleConnections(...)));
+        $timer = $loop->addPeriodicTimer($discardIdleConnectionsIn, async(function () {
+            $this->loggerInterface?->debug("Called discard connections");
+            // $size = $this->size();
+            // echo "Timer called. Number of active connections $size" . PHP_EOL;
+            // echo "Borrowed connections " . $this->locked->count() . PHP_EOL;
+            $now = \time();
+            while (!$this->idle->isEmpty()) {
+                $connection = $this->idle->first();
+
+                if ($connection->getLastUsedAt() + $this->idleTimeout > $now) {
+                    return;
+                }
+
+                // Close connection and remove it from the pool.
+                $this->idle->remove($connection);
+                $connection->close();
+            }
+        }));
 
         $this->loopInterface = $loop;
         $this->isClosed = false;
         $this->onClose
             ->promise()
-            ->finally(static fn() => $loop->cancelTimer($timer));
+            ->finally(fn() => $loop->cancelTimer($timer));
     }
 
     public function size(): int
@@ -91,7 +108,8 @@ class ConnectionPool implements ConnectionPoolInterface
         $this->close();
     }
 
-    public function getCountPopAttempts(){
+    public function getCountPopAttempts()
+    {
         return $this->countPopAttempts;
     }
 
@@ -145,6 +163,8 @@ class ConnectionPool implements ConnectionPoolInterface
     }
 
     /**
+     * This method will return synchronously the element in the connection pool
+     * 
      * @return PoolItem<T>
      *
      * @throws SqlException
@@ -152,6 +172,12 @@ class ConnectionPool implements ConnectionPoolInterface
     public function get(): PoolItem
     {
         return await($this->pop());
+    }
+
+    /** @return PromiseInterface<PoolItem<T>> */
+    public function getAsync(): PromiseInterface
+    {
+        return $this->pop();
     }
 
     /** @param PoolItem<T> $connection */
@@ -201,8 +227,8 @@ class ConnectionPool implements ConnectionPoolInterface
 
         // If no idle connections are available, create a new one if allowed.
         if ($this->size() < $this->maxConnections) {
-            $connection = $this->createConnection();
-            
+            $connection = await($this->createConnection());
+
             if (!is_null($connection)) {
                 $this->loggerInterface?->debug("Connection created.");
 
@@ -226,7 +252,7 @@ class ConnectionPool implements ConnectionPoolInterface
     protected function push(PoolItem $connection): void
     {
         \assert(
-            isset($this->locked[$connection]),
+            $this->locked->contains($connection),
             "Connection is not part of this pool"
         );
 
@@ -240,35 +266,28 @@ class ConnectionPool implements ConnectionPoolInterface
         $this->awaitingConnection = null;
     }
 
-    /** @return PoolItem<T> */
-    private function createConnection(): ?PoolItem
+    /** @return PromiseInterface<PoolItem<T>> */
+    private function createConnection(): ?PromiseInterface
     {
-        $connection = $this->factory->create();
+        return new Promise(function (\Closure $resolve, \Closure $reject) {
+            $connection = $this->factory->create();
 
-        if ($this->isClosed()) {
-            $connection->close();
-
-            return null;
-        }
-
-        return $connection;
-    }
-
-    public function discardIdleConnections()
-    {
-        $this->loggerInterface?->debug("Called discard connections");
-        $now = \time();
-        while (!$this->idle->isEmpty()) {
-            $connection = $this->idle->first();
-
-            if ($connection->getLastUsedAt() + $this->idleTimeout > $now) {
-                return;
+            if (is_null($connection)) {
+                $resolve(null);
             }
 
-            // Close connection and remove it from the pool.
-            $this->idle->remove($connection);
-            $connection->close();
-        }
+            if ($this->isClosed()) {
+                $connection->close();
+
+                $resolve(null);
+            }
+
+            if ($connection->validate()) {
+                $resolve($connection);
+            }
+
+            $reject(new \Error("Invalid object created for " . get_class($connection) . PHP_EOL));
+        });
     }
 
     private function resetAttemptsCounter()
