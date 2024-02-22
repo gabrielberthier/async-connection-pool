@@ -76,7 +76,7 @@ return function () {
     return async(function (Psr\Http\Message\ServerRequestInterface $request) {
         $factory = new PdoFactoryImplementation();
         $connectionPool = PoolFactory::get($factory);
-        // return executeSync($connectionPool);
+        return executeSync($connectionPool);
         // OR
         return executeAsync($connectionPool);
     });
