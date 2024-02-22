@@ -1,12 +1,10 @@
-# [unstable] gabriel/reactphp-connection-pool
+# ReactPHP Connection Pool
 
 Async and flexible pool for any type of connections built on top of [ReactPHP](https://reactphp.org/).
 
 Connection pooling allows you to easily manage range of connections with some remote service (e.g. a database server). You can define how many connections your app can estabilish or how to react when all connections are busy at the same time.
 
-- **State monitoring** - each adapter maintains its connection state ("Ready", "Busy" or "Disconnected"). Based on this, the connection selector can determine if the specific connection is currently ready to use. This is especially useful when you use stateful operations (e.g. database transactions).
-- **Flexible** - manage any type of connections by implementing your own connection adapter and specify how connections are to be selected for use by passing proper connection selector.
-- **Lightweight and simple** - in assumptions it is a simple component that can be freely extended according to your preferences.
+This library will handle closing connections after a certain timeout, create connections as they are required and manage connections' states, however it is still **Flexible** enough to manage any type of connections by implementing your own connection adapter and specify how connections are created AND **Lightweight**, as it uses very few external components. In addition, it is a simple component that can be freely extended according to your preferences and needs.
 
 ## Requirements
 
@@ -15,32 +13,61 @@ Connection pooling allows you to easily manage range of connections with some re
 ## Examples
 
 ```php
-class MyConnectionAdapter implements Ravine\ConnectionPool\ConnectionAdapters\ConnectionAdapterInterface
+final class PdoAdapter extends PoolItem
 {
-  // Implementation of adapter for your connection.
+    public function __construct()
+    {
+        parent::__construct(
+            new \PDO(
+                dsn: 'mysql:host=127.0.0.1;dbname=test',
+                username: 'root',
+                password: '123456',
+                options: array(
+                    \PDO::ATTR_PERSISTENT => true
+                )
+            )
+        );
+    }
+
+    protected function onClose(): void
+    {
+
+    }
+
+    function validate(): bool
+    {
+        return $this->item instanceof \PDO;
+    }
 }
 
-$pool = new Ravine\ConnectionPool\ConnectionPool(fn () => new MyConnectionAdapter());
-$adapter = React\Async\await($pool->get());
-$connection = React\Async\await($adapter->getConnection());
-// `$connection` is ready to use :)
+class PdoFactoryImplementation implements ObjectFactoryInterface
+{
+    public function create(): ?PoolItem
+    {
+        return new PdoAdapter();
+    }
+}
+
+$sut = new ConnectionPool(new PdoFactoryImplementation());
+/** @var \PDO */
+$result = $sut->get()->reveal();
+
 ```
 
-## Additional Configuration
+## Configuration
 
-You can pass additional parameters to pool constructor:
+It is **mandatory** to pass an instance of _ObjectFactoryInterface_ to the constructor of either Ravine\ConnectionPool\PoolFactory or Ravine\ConnectionPool\ConnectionPool. The other parameters are inferred from predefined values that came to me in a dream as a good default values.
 
-- `connectionSelectorClass` - define algorithm used for selecting connections (by default simple `UsageConnectionSelector` is used).
-- `connectionsLimit` - maximum number of connections that can be created (`null` for unlimited).
-- `retryLimit` - how many times try to search for an active connection before rejecting (`null` for unlimited, `0` for immediately rejection if none at the moment).
-- `retryEverySec` - check for available connections every how many seconds (only if $retryLimit is enabled).
-- `loop` - instance of `React\EventLoop\LoopInterface` to use.
+**BUT**:
 
-## Todo
+You can still pass additional parameters to pool's constructor:
 
-- Built-in adapters (`clue/reactphp-redis`, `friends-of-reactphp/mysql`).
-- Connection selector based on Round Robin algorithm.
-- Reconnection.
+- `maxConnections`: number of connections to be open in a single process (remember, PHP is single threaded).
+- `idleTimeout`: timeout (in seconds) to dispose idle connections.
+- `maxRetries`: number of attempts JUST IN CASE your factory returns a nullable value from an error.
+- `discardIdleConnectionsIn`: number of seconds to look up for removable connections.
+- `loggerInterface`: a PRS\LoggerInstance to log interactions in this component.
+- `loop`: instance of `React\EventLoop\LoopInterface` to use.
 
 ## At the end
 
